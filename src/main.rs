@@ -84,6 +84,12 @@ struct Args {
 
     #[clap(long, default_value = "15")]
     scrape_interval: u64,
+
+    #[clap(long, default_value = "9982")]
+    listen_port: u64,
+
+    #[clap(long, default_value = "127.0.0.1")]
+    listen_address: String,
 }
 
 #[tokio::main]
@@ -102,7 +108,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.account.clone(),
     ));
 
-    warp::serve(metrics_route).run(([0, 0, 0, 0], 8080)).await;
+    warp::serve(metrics_route)
+        .run(
+            format!("{}:{}", args.listen_address, args.listen_port)
+                .parse::<std::net::SocketAddr>()
+                .expect("listen address correct"),
+        )
+        .await;
 
     Ok(())
 }
