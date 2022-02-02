@@ -1,6 +1,6 @@
 use anyhow::bail;
 use clap::Parser;
-use concordium::{p2p_client::P2pClient, Empty, GetAddressInfoRequest};
+use concordium::{p2p_client::P2pClient, Empty, GetAddressInfoRequest, PeersRequest};
 use prometheus::{GaugeVec, Opts, Registry};
 use serde_json::Value;
 use std::time::Duration;
@@ -16,6 +16,9 @@ pub struct PrometheusStats {
     account_staked_amount: GaugeVec,
     account_not_staked_amount: GaugeVec,
     account_scheduled_amount: GaugeVec,
+    node_uptime: GaugeVec,
+    node_peers_average_latency: GaugeVec,
+    node_peers_count: GaugeVec,
     registry: Registry,
 }
 
@@ -42,6 +45,21 @@ impl PrometheusStats {
                 &["address"],
             )
             .expect("metric can be created"),
+            node_uptime: GaugeVec::new(
+                Opts::new("node_uptime", "Node uptime"),
+                &["node", "version", "online", "baking_committee", "finalization_committee"],
+            )
+            .expect("metric can be created"),
+            node_peers_average_latency: GaugeVec::new(
+                Opts::new("node_peers_average_latency", "Node peers average latency"),
+                &["node"],
+            )
+            .expect("metric can be created"),
+            node_peers_count: GaugeVec::new(
+                Opts::new("node_peers_count", "Node peer count"),
+                &["node"],
+            )
+            .expect("metric can be created"),
             registry: Registry::new(),
         };
         instance
@@ -61,6 +79,18 @@ impl PrometheusStats {
             .register(Box::new(instance.account_not_staked_amount.clone()))
             .expect("collector can be registered");
         instance
+            .registry
+            .register(Box::new(instance.node_uptime.clone()))
+            .expect("collector can be registered");
+        instance
+            .registry
+            .register(Box::new(instance.node_peers_count.clone()))
+            .expect("collector can be registered");
+        instance
+            .registry
+            .register(Box::new(instance.node_peers_average_latency.clone()))
+            .expect("collector can be registered");
+        instance
     }
 }
 
@@ -75,6 +105,9 @@ impl Default for PrometheusStats {
 struct Args {
     #[clap(long)]
     account: Vec<String>,
+
+    #[clap(long)]
+    node: Vec<String>,
 
     #[clap(long, default_value = "grpc://127.0.0.1:10000")]
     grpc_url: String,
@@ -106,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.grpc_url.clone(),
         args.token.clone(),
         args.account.clone(),
+        args.node.clone(),
     ));
 
     warp::serve(metrics_route)
@@ -131,19 +165,51 @@ async fn data_collector(
     grpc_url: String,
     token: String,
     accounts: Vec<String>,
+    nodes: Vec<String>,
 ) {
     let mut collect_interval = tokio::time::interval(Duration::from_secs(scrape_interval));
     loop {
         collect_interval.tick().await;
         for i in &accounts {
             match get_address_balance(&grpc_url, &token, i).await {
-                Ok(res) => {
-                    stats.account_balance.with_label_values(&[i]).set(res.0);
-                    stats.account_scheduled_amount.with_label_values(&[i]).set(res.1);
-                    stats.account_staked_amount.with_label_values(&[i]).set(res.2);
-                    stats.account_not_staked_amount.with_label_values(&[i]).set(res.0 - res.2);
+                Ok((balance, scheduled, staked)) => {
+                    stats.account_balance.with_label_values(&[i]).set(balance);
+                    stats.account_scheduled_amount.with_label_values(&[i]).set(scheduled);
+                    stats.account_staked_amount.with_label_values(&[i]).set(staked);
+                    stats.account_not_staked_amount.with_label_values(&[i]).set(balance - staked);
                 }
-                _ => println!("Could not obtain data for address {}", i),
+                _ => eprintln!("Could not obtain data for address {}", i),
+            }
+        }
+        for i in &nodes {
+            match get_node_stats(i, &token).await {
+                Ok((
+                    version,
+                    uptime,
+                    average_latency,
+                    peers_count,
+                    baking_committee,
+                    finalization_committee,
+                )) => {
+                    stats
+                        .node_uptime
+                        .with_label_values(&[
+                            i,
+                            &version,
+                            "1",
+                            &baking_committee.to_string(),
+                            &finalization_committee.to_string(),
+                        ])
+                        .set(uptime as f64);
+                    stats.node_peers_average_latency.with_label_values(&[i]).set(average_latency);
+                    stats.node_peers_count.with_label_values(&[i]).set(peers_count as f64);
+                }
+                _ => {
+                    stats.node_uptime.with_label_values(&[i, "N/A", "0", "0", "0"]).set(0.00);
+                    stats.node_peers_average_latency.with_label_values(&[i]).set(0.00);
+                    stats.node_peers_count.with_label_values(&[i]).set(0.00);
+                    eprintln!("Could not obtain stats from host {}", i);
+                }
             }
         }
     }
@@ -203,6 +269,53 @@ async fn get_address_balance(
     }
 }
 
+async fn get_node_stats(
+    host: &str,
+    token: &str,
+) -> anyhow::Result<(String, u64, f64, usize, usize, usize)> {
+    let channel =
+        Channel::from_shared(format!("grpc://{}", host.to_owned())).unwrap().connect().await?;
+    let mut client = P2pClient::new(channel);
+
+    // Query node for info
+    let node_version_resp = client.peer_version(empty_req(token)).await?;
+    let peer_stats_resp = client.peer_stats(get_peers_req(token)).await?;
+    let node_info_resp = client.node_info(empty_req(token)).await?;
+    let node_uptime_resp = client.peer_uptime(empty_req(token)).await?;
+
+    let node_version = node_version_resp.get_ref().value.to_string();
+    let node_uptime = node_uptime_resp.get_ref().value;
+
+    let peers_average_latency = peer_stats_resp
+        .get_ref()
+        .peerstats
+        .iter()
+        .map(|element| element.latency)
+        .sum::<u64>() as f64
+        / peer_stats_resp.get_ref().peerstats.iter().filter(|element| element.latency > 0).count()
+            as f64;
+    let peers_count = peer_stats_resp.get_ref().peerstats.len();
+
+    let baker_committee = match node_info_resp.get_ref().consensus_baker_committee() {
+        concordium::node_info_response::IsInBakingCommittee::ActiveInCommittee => 1,
+        _ => 0,
+    };
+
+    let finalization_committee = match node_info_resp.get_ref().consensus_finalizer_committee {
+        true => 1,
+        _ => 0,
+    };
+
+    Ok((
+        node_version,
+        node_uptime,
+        peers_average_latency,
+        peers_count,
+        baker_committee,
+        finalization_committee,
+    ))
+}
+
 async fn metrics_handler(stats: PrometheusStats) -> Result<impl Reply, Rejection> {
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
@@ -238,15 +351,23 @@ async fn metrics_handler(stats: PrometheusStats) -> Result<impl Reply, Rejection
 }
 
 fn empty_req(token: &str) -> Request<Empty> {
-    let mut req = Request::new(concordium::Empty {});
+    let mut req = Request::new(Empty {});
     req.metadata_mut().insert("authentication", MetadataValue::from_str(token).unwrap());
     req
 }
 
 fn get_address_info_req(token: &str, address: &str, block: &str) -> Request<GetAddressInfoRequest> {
-    let mut req = Request::new(concordium::GetAddressInfoRequest {
+    let mut req = Request::new(GetAddressInfoRequest {
         address: address.to_owned(),
         block_hash: block.to_owned(),
+    });
+    req.metadata_mut().insert("authentication", MetadataValue::from_str(token).unwrap());
+    req
+}
+
+fn get_peers_req(token: &str) -> Request<PeersRequest> {
+    let mut req = Request::new(PeersRequest {
+        include_bootstrappers: false,
     });
     req.metadata_mut().insert("authentication", MetadataValue::from_str(token).unwrap());
     req
